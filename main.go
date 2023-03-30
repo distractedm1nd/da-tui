@@ -22,23 +22,16 @@ import (
 )
 
 const (
-	padding  = 2
-	maxWidth = 80
+	padding = 2
 )
 
 var (
-	titleStyle        = lipgloss.NewStyle()
-	itemStyle         = lipgloss.NewStyle().PaddingLeft(4)
-	selectedItemStyle = lipgloss.NewStyle().PaddingLeft(2).Foreground(lipgloss.Color("170"))
-	paginationStyle   = list.DefaultStyles().PaginationStyle.PaddingLeft(4)
-	quitTextStyle     = lipgloss.NewStyle().Margin(1, 0, 2, 4)
-	panelStyle        = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder())
-	activePanelStyle  = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("69"))
+	titleStyle       = lipgloss.NewStyle()
+	paginationStyle  = list.DefaultStyles().PaginationStyle.PaddingLeft(4)
+	panelStyle       = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder())
+	activePanelStyle = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("69"))
+	docStyle         = lipgloss.NewStyle().Margin(1, 1, 1, 1)
 )
-
-type panelDimensions struct {
-	w, h int
-}
 
 type item struct {
 	title, desc string
@@ -48,19 +41,8 @@ func (i item) Title() string       { return i.title }
 func (i item) Description() string { return i.desc }
 func (i item) FilterValue() string { return i.title }
 
-var docStyle = lipgloss.NewStyle().Margin(1, 1, 1, 1)
-
-var helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#626262")).Render
-
-func waitForActivity(sub <-chan *header.ExtendedHeader) tea.Cmd {
-	return func() tea.Msg {
-		header := <-sub
-		return header
-	}
-}
-
 func main() {
-	celestiaClient, err := client.NewClient(context.TODO(), "ws://localhost:26658", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJBbGxvdyI6WyJwdWJsaWMiLCJyZWFkIiwid3JpdGUiLCJhZG1pbiJdfQ.AShMh2DTTd7DsoGfZVUIPPhH5h8ezPxOyS_LdjTI2G8")
+	celestiaClient, err := client.NewClient(context.TODO(), "ws://localhost:26658", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJBbGxvdyI6WyJwdWJsaWMiLCJyZWFkIiwid3JpdGUiLCJhZG1pbiJdfQ.u1B4Fz-udHWRcxV8u6ncgE57AgivtbPQGdyFUwWrIsI")
 
 	if err != nil {
 		panic(err)
@@ -76,6 +58,7 @@ func main() {
 	}
 	m := model{
 		samplingProgress: progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
+		syncerProgress:   progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
 		client:           celestiaClient,
 		width:            0,
 		height:           0,
@@ -107,6 +90,7 @@ type tickMsg time.Time
 
 type model struct {
 	samplingProgress progress.Model
+	syncerProgress   progress.Model
 	client           *client.Client
 	currentStats     *das.SamplingStats
 	syncStats        *sync.State
@@ -182,16 +166,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.updatePeers()
 
-		// Note that you can also use samplingProgress.Model.SetPercent to set the
-		// percentage value explicitly, too.
-		cmd := m.samplingProgress.SetPercent(float64(stats.SampledChainHead) / float64(stats.NetworkHead))
-		return m, tea.Batch(tickCmd(), cmd)
+		setSamplingProgress := m.samplingProgress.SetPercent(float64(stats.SampledChainHead) / float64(stats.NetworkHead))
+		setSyncerProgress := m.syncerProgress.SetPercent(float64(m.syncStats.Height-m.syncStats.FromHeight) / float64(m.syncStats.ToHeight-m.syncStats.FromHeight))
+		return m, tea.Batch(tickCmd(), setSamplingProgress, setSyncerProgress)
 
 	// FrameMsg is sent when the samplingProgress bar wants to animate itself
 	case progress.FrameMsg:
 		progressModel, cmd := m.samplingProgress.Update(msg)
 		m.samplingProgress = progressModel.(progress.Model)
-		return m, cmd
+		syncerModel, cmd2 := m.syncerProgress.Update(msg)
+		m.syncerProgress = syncerModel.(progress.Model)
+		return m, tea.Batch(cmd, cmd2)
 	}
 
 	if m.activePanel == 1 {
@@ -313,10 +298,9 @@ func (m *model) syncerPanel(frameHeight int) string {
 	}
 
 	if m.syncStats != nil {
-		progressBar := progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage())
-		progressBar.Width = (m.width / 3) - frameHeight - 4*padding - 1 - len(strconv.FormatUint(m.syncStats.FromHeight, 10)) - len(strconv.FormatUint(m.syncStats.ToHeight, 10))
+		m.syncerProgress.Width = (m.width / 3) - frameHeight - 4*padding - 1 - len(strconv.FormatUint(m.syncStats.FromHeight, 10)) - len(strconv.FormatUint(m.syncStats.ToHeight, 10))
 		syncerPanel = "Syncer Progress: \n\n" +
-			pad + strconv.FormatUint(m.syncStats.FromHeight, 10) + pad + progressBar.ViewAs(float64(m.syncStats.ToHeight-m.syncStats.FromHeight)/float64(m.syncStats.ToHeight-m.syncStats.FromHeight)) + pad + strconv.FormatUint(m.syncStats.ToHeight, 10) + pad + "\n\n" +
+			pad + strconv.FormatUint(m.syncStats.FromHeight, 10) + pad + m.syncerProgress.View() + pad + strconv.FormatUint(m.syncStats.ToHeight, 10) + pad + "\n\n" +
 			"Syncer Height: " + strconv.FormatUint(m.syncStats.Height, 10)
 	}
 
@@ -359,4 +343,11 @@ func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second/2, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+func waitForActivity(sub <-chan *header.ExtendedHeader) tea.Cmd {
+	return func() tea.Msg {
+		header := <-sub
+		return header
+	}
 }
