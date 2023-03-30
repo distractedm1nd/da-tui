@@ -3,6 +3,8 @@
 
 It has panels for DASer status, header sync status, peers, and incoming headers. It currently runs on an unreleased version of celestia-node, which has support for streaming extended headers over the RPC.
 
+![Screenshot](./screenshot.png)
+
 ### USAGE:
 ```bash
 go run main.go ws://localhost:26658 $AUTH_TOKEN
