@@ -26,6 +26,7 @@ const (
 )
 
 var (
+	pad              = strings.Repeat(" ", padding)
 	titleStyle       = lipgloss.NewStyle()
 	paginationStyle  = list.DefaultStyles().PaginationStyle.PaddingLeft(4)
 	panelStyle       = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder())
@@ -33,24 +34,34 @@ var (
 	docStyle         = lipgloss.NewStyle().Margin(1, 1, 1, 1)
 )
 
-type item struct {
+type panel int
+
+const (
+	daserPanel panel = iota
+	headerPanel
+	syncerPanel
+	peerPanel
+	bannedPeerPanel
+)
+
+type listItem struct {
 	title, desc string
 }
 
-func (i item) Title() string       { return i.title }
-func (i item) Description() string { return i.desc }
-func (i item) FilterValue() string { return i.title }
+func (i listItem) Title() string       { return i.title }
+func (i listItem) Description() string { return i.desc }
+func (i listItem) FilterValue() string { return i.title }
 
 func main() {
-	celestiaClient, err := client.NewClient(context.TODO(), "ws://localhost:26658", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJBbGxvdyI6WyJwdWJsaWMiLCJyZWFkIiwid3JpdGUiLCJhZG1pbiJdfQ.u1B4Fz-udHWRcxV8u6ncgE57AgivtbPQGdyFUwWrIsI")
+	celestiaClient, err := client.NewClient(
+		context.TODO(),
+		os.Args[1],
+		os.Args[2],
+	)
 
 	if err != nil {
 		panic(err)
 	}
-
-	peerList := createList("Peers")
-	bannedPeerList := createList("Banned Peers")
-	headerList := createList("Incoming Headers")
 
 	headerSub, err := celestiaClient.Header.Subscribe(context.Background())
 	if err != nil {
@@ -60,11 +71,9 @@ func main() {
 		samplingProgress: progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
 		syncerProgress:   progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage()),
 		client:           celestiaClient,
-		width:            0,
-		height:           0,
-		peerList:         peerList,
-		bannedPeerList:   bannedPeerList,
-		headerList:       headerList,
+		peerList:         createList("Peers"),
+		bannedPeerList:   createList("Banned Peers"),
+		headerList:       createList("Incoming Headers"),
 		headerSub:        headerSub,
 	}
 
@@ -77,33 +86,36 @@ func main() {
 func createList(title string) list.Model {
 	l := list.New(make([]list.Item, 0), list.NewDefaultDelegate(), 0, 0)
 	l.DisableQuitKeybindings()
-	l.Title = title
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(false)
+	l.Title = title
 	l.Styles.Title = titleStyle
 	l.Styles.PaginationStyle = paginationStyle
-
 	return l
 }
 
 type tickMsg time.Time
 
 type model struct {
-	samplingProgress progress.Model
-	syncerProgress   progress.Model
-	client           *client.Client
+	client *client.Client
+
 	currentStats     *das.SamplingStats
-	syncStats        *sync.State
-	headerSub        <-chan *header.ExtendedHeader
-	headerList       list.Model
-	peerList         list.Model
-	bannedPeerList   list.Model
-	bannedPeers      []peer.AddrInfo
-	peers            []peer.AddrInfo
-	selectedPeer     string
-	activePanel      int
-	width            int
-	height           int
+	samplingProgress progress.Model
+
+	syncStats      *sync.State
+	syncerProgress progress.Model
+
+	headerSub  <-chan *header.ExtendedHeader
+	headerList list.Model
+
+	peerList list.Model
+	peers    []peer.AddrInfo
+
+	bannedPeerList list.Model
+	bannedPeers    []peer.AddrInfo
+
+	activePanel   panel
+	width, height int
 }
 
 func (m *model) Init() tea.Cmd {
@@ -113,10 +125,7 @@ func (m *model) Init() tea.Cmd {
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case *header.ExtendedHeader:
-		m.headerList.InsertItem(len(m.headerList.Items()), item{title: strconv.FormatInt(msg.Height(), 10), desc: msg.Hash().String()})
-		var cmd tea.Cmd
-		m.headerList, cmd = m.headerList.Update(msg)
-		return m, tea.Batch(cmd, waitForActivity(m.headerSub))
+		return m, m.handleIncomingHeader(msg)
 	case tea.KeyMsg:
 		switch keypress := msg.String(); keypress {
 		case "ctrl+c":
@@ -124,136 +133,44 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "tab":
 			m.activePanel = (m.activePanel + 1) % 5
 		case "b":
-			if m.activePanel == 3 {
-				peerID, err := peer.Decode(m.peerList.SelectedItem().(item).Title())
-				if err != nil {
-					panic(err)
-				}
-				err = m.client.P2P.BlockPeer(context.TODO(), peerID)
-				if err != nil {
-					panic(err)
-				}
-			}
+			m.handleBanPeer()
 		case "u":
-			if m.activePanel == 4 {
-				peerID, err := peer.Decode(m.bannedPeerList.SelectedItem().(item).Title())
-				if err != nil {
-					panic(err)
-				}
-				err = m.client.P2P.UnblockPeer(context.TODO(), peerID)
-				if err != nil {
-					panic(err)
-				}
-			}
+			m.handleUnbanPeer()
 		}
-
 	case tea.WindowSizeMsg:
 		m.height, m.width = msg.Height, msg.Width
 		return m, nil
-
 	case tickMsg:
-		stats, err := m.client.DAS.SamplingStats(context.TODO())
-		m.currentStats = &stats
-		if err != nil {
-			panic(err)
-		}
-
-		syncStats, err := m.client.Header.SyncState(context.TODO())
-		m.syncStats = &syncStats
-		if err != nil {
-			panic(err)
-		}
-
-		m.updatePeers()
-
-		setSamplingProgress := m.samplingProgress.SetPercent(float64(stats.SampledChainHead) / float64(stats.NetworkHead))
-		setSyncerProgress := m.syncerProgress.SetPercent(float64(m.syncStats.Height-m.syncStats.FromHeight) / float64(m.syncStats.ToHeight-m.syncStats.FromHeight))
-		return m, tea.Batch(tickCmd(), setSamplingProgress, setSyncerProgress)
-
+		updateStats := m.updateStats()
+		updatePeers := m.updatePeers()
+		return m, tea.Batch(tickCmd(), updateStats, updatePeers)
 	// FrameMsg is sent when the samplingProgress bar wants to animate itself
 	case progress.FrameMsg:
 		progressModel, cmd := m.samplingProgress.Update(msg)
-		m.samplingProgress = progressModel.(progress.Model)
 		syncerModel, cmd2 := m.syncerProgress.Update(msg)
+
+		m.samplingProgress = progressModel.(progress.Model)
 		m.syncerProgress = syncerModel.(progress.Model)
 		return m, tea.Batch(cmd, cmd2)
 	}
 
-	if m.activePanel == 1 {
+	// handle navigation keypresses for the list panels
+	switch m.activePanel {
+	case headerPanel:
 		var cmd tea.Cmd
 		m.headerList, cmd = m.headerList.Update(msg)
 		return m, cmd
-	} else if m.activePanel == 3 {
+	case peerPanel:
 		var cmd tea.Cmd
 		m.peerList, cmd = m.peerList.Update(msg)
 		return m, cmd
-	} else if m.activePanel == 4 {
+	case bannedPeerPanel:
 		var cmd tea.Cmd
 		m.bannedPeerList, cmd = m.bannedPeerList.Update(msg)
 		return m, cmd
-	} else {
+	default:
 		return m, nil
 	}
-}
-
-func (m *model) getAddrInfo(peer peer.ID) peer.AddrInfo {
-	addrInfo, _ := m.client.P2P.PeerInfo(context.TODO(), peer)
-	sort.Slice(addrInfo.Addrs, func(i, j int) bool {
-		return addrInfo.Addrs[i].String() < addrInfo.Addrs[j].String()
-	})
-	return addrInfo
-}
-
-func (m *model) updatePeers() {
-	banned := make(map[string]struct{})
-	bannedPeers, _ := m.client.P2P.ListBlockedPeers(context.TODO())
-	sort.Slice(bannedPeers, func(i, j int) bool {
-		return bannedPeers[i].String() < bannedPeers[j].String()
-	})
-	if len(bannedPeers) != len(m.bannedPeers) {
-		m.bannedPeers = make([]peer.AddrInfo, 0)
-		for _, peer := range bannedPeers {
-			banned[peer.String()] = struct{}{}
-			m.bannedPeers = append(m.bannedPeers, m.getAddrInfo(peer))
-		}
-		var peerListItems []list.Item
-		for _, peer := range m.bannedPeers {
-			desc := "No multiaddr found"
-			if len(peer.Addrs) > 0 {
-				desc = peer.Addrs[0].String()
-			}
-			peerListItems = append(peerListItems, item{title: peer.ID.String(), desc: desc})
-		}
-		m.bannedPeerList.SetItems(peerListItems)
-	}
-
-	peers, _ := m.client.P2P.Peers(context.TODO())
-	sort.Slice(peers, func(i, j int) bool {
-		return peers[i].String() < peers[j].String()
-	})
-	if len(peers)-len(bannedPeers) != len(m.peers) {
-		m.peers = make([]peer.AddrInfo, 0)
-		for _, peer := range peers {
-			_, ok := banned[peer.String()]
-			if !ok {
-				m.peers = append(m.peers, m.getAddrInfo(peer))
-			}
-		}
-		var peerListItems []list.Item
-		for _, peer := range m.peers {
-			desc := "No multiaddr found"
-			if len(peer.Addrs) > 0 {
-				desc = peer.Addrs[0].String()
-			}
-			peerListItems = append(peerListItems, item{title: peer.ID.String(), desc: desc})
-		}
-		m.peerList.SetItems(peerListItems)
-	}
-}
-
-func (m *model) getPanelDimensions(scaleW, scaleH float64) (w, h int) {
-	h, v := docStyle.GetFrameSize()
-	return int(float64(m.width)*scaleW) - h, int(float64(m.height)*scaleH) - v
 }
 
 func (m *model) View() string {
@@ -290,55 +207,6 @@ func (m *model) View() string {
 	)
 }
 
-func (m *model) syncerPanel(frameHeight int) string {
-	var syncerPanel string
-	pad := strings.Repeat(" ", padding)
-	if m.syncStats == nil {
-		syncerPanel = "Syncer Stats Loading...\n"
-	}
-
-	if m.syncStats != nil {
-		m.syncerProgress.Width = (m.width / 3) - frameHeight - 4*padding - 1 - len(strconv.FormatUint(m.syncStats.FromHeight, 10)) - len(strconv.FormatUint(m.syncStats.ToHeight, 10))
-		syncerPanel = "Syncer Progress: \n\n" +
-			pad + strconv.FormatUint(m.syncStats.FromHeight, 10) + pad + m.syncerProgress.View() + pad + strconv.FormatUint(m.syncStats.ToHeight, 10) + pad + "\n\n" +
-			"Syncer Height: " + strconv.FormatUint(m.syncStats.Height, 10)
-	}
-
-	return syncerPanel
-}
-
-func (m *model) daserPanel(frameHeight int) string {
-	var daserPanel string
-	pad := strings.Repeat(" ", padding)
-	if m.currentStats == nil {
-		daserPanel = "\n" +
-			pad + m.samplingProgress.View()
-	}
-
-	var workerString string
-	if m.currentStats != nil {
-		sort.Slice(m.currentStats.Workers, func(i, j int) bool {
-			return m.currentStats.Workers[i].From < m.currentStats.Workers[j].From
-		})
-		workerString = "Workers: \n"
-		for _, worker := range m.currentStats.Workers {
-			progressBar := progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage())
-			workerString += pad + strconv.FormatUint(worker.From, 10) + pad + progressBar.ViewAs(float64(worker.Curr-worker.From)/float64(worker.To-worker.From)) + pad + strconv.FormatUint(worker.To, 10) + "\n"
-		}
-		workerString += "\n\n"
-
-		m.samplingProgress.Width = (2 * m.width / 3) - frameHeight - 4*padding - 1 - len(strconv.FormatUint(m.currentStats.NetworkHead, 10))
-		daserPanel = "DASer Progress: \n" +
-			pad + "0" + pad + m.samplingProgress.View() + pad + strconv.FormatUint(m.currentStats.NetworkHead, 10) + pad + "\n\n" +
-			pad + "Sampled Chain Head: " + strconv.FormatUint(m.currentStats.SampledChainHead, 10) + "\n" +
-			pad + "Network Head: " + strconv.FormatUint(m.currentStats.NetworkHead, 10) + "\n" +
-			pad + "Head of Catchup: " + strconv.FormatUint(m.currentStats.CatchupHead, 10) + "\n\n" +
-			workerString
-	}
-
-	return daserPanel
-}
-
 func tickCmd() tea.Cmd {
 	return tea.Tick(time.Second/2, func(t time.Time) tea.Msg {
 		return tickMsg(t)
@@ -347,7 +215,199 @@ func tickCmd() tea.Cmd {
 
 func waitForActivity(sub <-chan *header.ExtendedHeader) tea.Cmd {
 	return func() tea.Msg {
-		header := <-sub
-		return header
+		return <-sub
 	}
+}
+
+func (m *model) handleBanPeer() {
+	if m.activePanel == peerPanel {
+		peerID, err := peer.Decode(m.peerList.SelectedItem().(listItem).Title())
+		if err != nil {
+			panic(err)
+		}
+		err = m.client.P2P.BlockPeer(context.TODO(), peerID)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func (m *model) handleUnbanPeer() {
+	if m.activePanel == bannedPeerPanel {
+		peerID, err := peer.Decode(m.bannedPeerList.SelectedItem().(listItem).Title())
+		if err != nil {
+			panic(err)
+		}
+		err = m.client.P2P.UnblockPeer(context.TODO(), peerID)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func (m *model) handleIncomingHeader(header *header.ExtendedHeader) tea.Cmd {
+	var cmd tea.Cmd
+	m.headerList.InsertItem(
+		len(m.headerList.Items()),
+		listItem{title: strconv.FormatInt(header.Height(), 10), desc: header.Hash().String()},
+	)
+
+	m.headerList, cmd = m.headerList.Update(header)
+	return tea.Batch(cmd, waitForActivity(m.headerSub))
+}
+
+func (m *model) getAddrInfo(peer peer.ID) peer.AddrInfo {
+	addrInfo, _ := m.client.P2P.PeerInfo(context.TODO(), peer)
+	sort.Slice(addrInfo.Addrs, func(i, j int) bool {
+		return addrInfo.Addrs[i].String() < addrInfo.Addrs[j].String()
+	})
+	return addrInfo
+}
+
+func (m *model) updateStats() tea.Cmd {
+	stats, err := m.client.DAS.SamplingStats(context.TODO())
+	if err != nil {
+		return nil
+	}
+	m.currentStats = &stats
+
+	syncStats, err := m.client.Header.SyncState(context.TODO())
+	if err != nil {
+		return nil
+	}
+	m.syncStats = &syncStats
+
+	setSamplingProgress := m.samplingProgress.SetPercent(
+		float64(stats.SampledChainHead) / float64(stats.NetworkHead),
+	)
+	setSyncerProgress := m.syncerProgress.SetPercent(
+		float64(m.syncStats.Height-m.syncStats.FromHeight) / float64(m.syncStats.ToHeight-m.syncStats.FromHeight),
+	)
+	return tea.Batch(setSamplingProgress, setSyncerProgress)
+}
+
+func (m *model) updatePeers() tea.Cmd {
+	banned, updateBanned := m.updateBannedPeers()
+	updateActive := m.updateActivePeers(banned)
+	return tea.Batch(updateBanned, updateActive)
+}
+
+func (m *model) updateBannedPeers() (map[string]struct{}, tea.Cmd) {
+	banned := make(map[string]struct{})
+	bannedPeers, err := m.client.P2P.ListBlockedPeers(context.TODO())
+	if err != nil {
+		return banned, nil
+	}
+	sort.Slice(bannedPeers, func(i, j int) bool {
+		return bannedPeers[i].String() < bannedPeers[j].String()
+	})
+
+	if len(bannedPeers) != len(m.bannedPeers) {
+		m.bannedPeers = make([]peer.AddrInfo, 0)
+		for _, peer := range bannedPeers {
+			banned[peer.String()] = struct{}{}
+			m.bannedPeers = append(m.bannedPeers, m.getAddrInfo(peer))
+		}
+		return banned, m.bannedPeerList.SetItems(m.buildPeerList(m.bannedPeers))
+	}
+
+	return banned, nil
+}
+
+// calling P2P.Peers() also returns banned peers, so we need to filter them out
+func (m *model) updateActivePeers(banned map[string]struct{}) tea.Cmd {
+	peers, err := m.client.P2P.Peers(context.TODO())
+	if err != nil {
+		return nil
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		return peers[i].String() < peers[j].String()
+	})
+
+	if len(peers)-len(banned) != len(m.peers) {
+		m.peers = make([]peer.AddrInfo, 0)
+		for _, peer := range peers {
+			_, ok := banned[peer.String()]
+			if !ok {
+				m.peers = append(m.peers, m.getAddrInfo(peer))
+			}
+		}
+		return m.peerList.SetItems(m.buildPeerList(m.peers))
+	}
+	return nil
+}
+
+func (m *model) buildPeerList(peers []peer.AddrInfo) []list.Item {
+	var peerListItems []list.Item
+	for _, peer := range peers {
+		desc := "No multiaddr found"
+		if len(peer.Addrs) > 0 {
+			desc = peer.Addrs[0].String()
+		}
+		peerListItems = append(peerListItems, listItem{title: peer.ID.String(), desc: desc})
+	}
+	return peerListItems
+}
+
+func (m *model) getPanelDimensions(scaleW, scaleH float64) (w, h int) {
+	h, v := docStyle.GetFrameSize()
+	return int(float64(m.width)*scaleW) - h, int(float64(m.height)*scaleH) - v
+}
+
+func (m *model) syncerPanel(frameHeight int) string {
+	var syncerPanel string
+	if m.syncStats == nil {
+		syncerPanel = "Syncer Stats Loading...\n"
+	}
+
+	if m.syncStats != nil {
+		fromHeight := strconv.FormatUint(m.syncStats.FromHeight, 10)
+		toHeight := strconv.FormatUint(m.syncStats.ToHeight, 10)
+		syncerHeight := strconv.FormatUint(m.syncStats.Height, 10)
+
+		m.syncerProgress.Width = (m.width / 3) - frameHeight - 4*padding - 1 - len(fromHeight) - len(toHeight)
+		syncerPanel = "Syncer Progress: \n\n" +
+			pad + fromHeight + pad + m.syncerProgress.View() + pad + toHeight + pad + "\n\n" +
+			"Syncer Height: " + syncerHeight
+	}
+
+	return syncerPanel
+}
+
+func (m *model) daserPanel(frameHeight int) string {
+	var daserPanel string
+	if m.currentStats == nil {
+		daserPanel = "\n" +
+			pad + m.samplingProgress.View()
+	}
+
+	if m.currentStats != nil {
+
+		m.samplingProgress.Width = (2 * m.width / 3) - frameHeight - 4*padding - 1 - len(strconv.FormatUint(m.currentStats.NetworkHead, 10))
+		daserPanel = "DASer Progress: \n" +
+			pad + "0" + pad + m.samplingProgress.View() + pad + strconv.FormatUint(m.currentStats.NetworkHead, 10) + pad + "\n\n" +
+			pad + "Sampled Chain Head: " + strconv.FormatUint(m.currentStats.SampledChainHead, 10) + "\n" +
+			pad + "Network Head: " + strconv.FormatUint(m.currentStats.NetworkHead, 10) + "\n" +
+			pad + "Head of Catchup: " + strconv.FormatUint(m.currentStats.CatchupHead, 10) + "\n\n" +
+			m.daserWorkers()
+	}
+
+	return daserPanel
+}
+
+func (m *model) daserWorkers() string {
+	sort.Slice(m.currentStats.Workers, func(i, j int) bool {
+		return m.currentStats.Workers[i].From < m.currentStats.Workers[j].From
+	})
+
+	workerString := "Workers: \n"
+	for _, worker := range m.currentStats.Workers {
+		progressBar := progress.New(progress.WithDefaultGradient(), progress.WithoutPercentage())
+		from, to := strconv.FormatUint(worker.From, 10), strconv.FormatUint(worker.To, 10)
+		percentageComplete := float64(worker.Curr-worker.From) / float64(worker.To-worker.From)
+		workerString += pad + from + pad + progressBar.ViewAs(percentageComplete) + pad + to + "\n"
+	}
+	workerString += "\n\n"
+
+	return workerString
 }
