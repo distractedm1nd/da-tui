@@ -36,6 +36,10 @@ var (
 	activePanelStyle  = lipgloss.NewStyle().BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("69"))
 )
 
+type panelDimensions struct {
+	w, h int
+}
+
 type item struct {
 	title, desc string
 }
@@ -81,7 +85,7 @@ func main() {
 		headerSub:        headerSub,
 	}
 
-	if _, err := tea.NewProgram(m).Run(); err != nil {
+	if _, err := tea.NewProgram(&m).Run(); err != nil {
 		fmt.Println("Oh no!", err)
 		os.Exit(1)
 	}
@@ -118,11 +122,11 @@ type model struct {
 	height           int
 }
 
-func (m model) Init() tea.Cmd {
+func (m *model) Init() tea.Cmd {
 	return tea.Batch(waitForActivity(m.headerSub), tickCmd())
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case *header.ExtendedHeader:
 		m.headerList.InsertItem(len(m.headerList.Items()), item{title: strconv.FormatInt(msg.Height(), 10), desc: msg.Hash().String()})
@@ -176,7 +180,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			panic(err)
 		}
 
-
 		m.updatePeers()
 
 		// Note that you can also use samplingProgress.Model.SetPercent to set the
@@ -208,23 +211,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m model) updatePeers() {
+func (m *model) getAddrInfo(peer peer.ID) peer.AddrInfo {
+	addrInfo, _ := m.client.P2P.PeerInfo(context.TODO(), peer)
+	sort.Slice(addrInfo.Addrs, func(i, j int) bool {
+		return addrInfo.Addrs[i].String() < addrInfo.Addrs[j].String()
+	})
+	return addrInfo
+}
+
+func (m *model) updatePeers() {
 	banned := make(map[string]struct{})
 	bannedPeers, _ := m.client.P2P.ListBlockedPeers(context.TODO())
 	sort.Slice(bannedPeers, func(i, j int) bool {
 		return bannedPeers[i].String() < bannedPeers[j].String()
 	})
-	originalLength := len(m.bannedPeers)
-	m.bannedPeers = make([]peer.AddrInfo, 0)
-	for _, peer := range bannedPeers {
-		banned[peer.String()] = struct{}{}
-		addrInfo, _ := m.client.P2P.PeerInfo(context.TODO(), peer)
-		sort.Slice(addrInfo.Addrs, func(i, j int) bool {
-			return addrInfo.Addrs[i].String() < addrInfo.Addrs[j].String()
-		})
-		m.bannedPeers = append(m.bannedPeers, addrInfo)
-	}
-	if originalLength != len(m.bannedPeers) {
+	if len(bannedPeers) != len(m.bannedPeers) {
+		m.bannedPeers = make([]peer.AddrInfo, 0)
+		for _, peer := range bannedPeers {
+			banned[peer.String()] = struct{}{}
+			m.bannedPeers = append(m.bannedPeers, m.getAddrInfo(peer))
+		}
 		var peerListItems []list.Item
 		for _, peer := range m.bannedPeers {
 			desc := "No multiaddr found"
@@ -240,19 +246,14 @@ func (m model) updatePeers() {
 	sort.Slice(peers, func(i, j int) bool {
 		return peers[i].String() < peers[j].String()
 	})
-	originalLength = len(m.peers)
-	m.peers = make([]peer.AddrInfo, 0)
-	for _, peer := range peers {
-		addrInfo, _ := m.client.P2P.PeerInfo(context.TODO(), peer)
-		sort.Slice(addrInfo.Addrs, func(i, j int) bool {
-			return addrInfo.Addrs[i].String() < addrInfo.Addrs[j].String()
-		})
-		_, ok := banned[peer.String()]
-		if !ok {
-			m.peers = append(m.peers, addrInfo)
+	if len(peers)-len(bannedPeers) != len(m.peers) {
+		m.peers = make([]peer.AddrInfo, 0)
+		for _, peer := range peers {
+			_, ok := banned[peer.String()]
+			if !ok {
+				m.peers = append(m.peers, m.getAddrInfo(peer))
+			}
 		}
-	}
-	if originalLength != len(m.peers) {
 		var peerListItems []list.Item
 		for _, peer := range m.peers {
 			desc := "No multiaddr found"
@@ -265,15 +266,25 @@ func (m model) updatePeers() {
 	}
 }
 
-func (m model) View() string {
+func (m *model) getPanelDimensions(scaleW, scaleH float64) (w, h int) {
 	h, v := docStyle.GetFrameSize()
+	return int(float64(m.width)*scaleW) - h, int(float64(m.height)*scaleH) - v
+}
 
-	m.peerList.SetHeight(m.height/3 - v)
-	m.peerList.SetWidth((m.width / 3) - h)
-	m.bannedPeerList.SetHeight(m.height/3 - v)
-	m.bannedPeerList.SetWidth((m.width / 3) - h)
-	m.headerList.SetHeight(m.height/3 - v)
-	m.headerList.SetWidth((2 * m.width / 3) - h)
+func (m *model) View() string {
+	h, _ := docStyle.GetFrameSize()
+
+	peerW, peerH := m.getPanelDimensions(0.33, 0.33)
+	headerW, headerH := m.getPanelDimensions(0.66, 0.33)
+	daserW, daserH := m.getPanelDimensions(0.66, 0.66)
+	syncerW, syncerH := m.getPanelDimensions(0.33, 0.33)
+
+	m.peerList.SetHeight(peerH)
+	m.peerList.SetWidth(peerW)
+	m.bannedPeerList.SetHeight(peerH)
+	m.bannedPeerList.SetWidth(peerW)
+	m.headerList.SetHeight(headerH)
+	m.headerList.SetWidth(headerW)
 
 	styles := []lipgloss.Style{panelStyle, panelStyle, panelStyle, panelStyle, panelStyle}
 	styles[m.activePanel] = activePanelStyle
@@ -282,19 +293,19 @@ func (m model) View() string {
 		lipgloss.Top,
 		lipgloss.JoinVertical(
 			lipgloss.Left,
-			styles[0].Width((2*m.width/3)-h).Height((2*m.height/3)-v).Render(m.daserPanel(h)),
-			styles[1].Width((2*m.width/3)-h).Height(m.height/3-v).Render(m.headerList.View()),
+			styles[0].Width(daserW).Height(daserH).Render(m.daserPanel(h)),
+			styles[1].Width(headerW).Height(headerH).Render(m.headerList.View()),
 		),
 		lipgloss.JoinVertical(
 			lipgloss.Right,
-			styles[2].Width((m.width/3)-h).Height(m.height/3-v).Render(m.syncerPanel(h)),
-			styles[3].Width((m.width/3)-h).Height(m.height/3-v).Render(m.peerList.View()),
-			styles[4].Width((m.width/3)-h).Height(m.height/3-v).Render(m.bannedPeerList.View()),
+			styles[2].Width(syncerW).Height(syncerH).Render(m.syncerPanel(h)),
+			styles[3].Width(peerW).Height(peerH).Render(m.peerList.View()),
+			styles[4].Width(peerW).Height(peerH).Render(m.bannedPeerList.View()),
 		),
 	)
 }
 
-func (m model) syncerPanel(frameHeight int) string {
+func (m *model) syncerPanel(frameHeight int) string {
 	var syncerPanel string
 	pad := strings.Repeat(" ", padding)
 	if m.syncStats == nil {
@@ -312,7 +323,7 @@ func (m model) syncerPanel(frameHeight int) string {
 	return syncerPanel
 }
 
-func (m model) daserPanel(frameHeight int) string {
+func (m *model) daserPanel(frameHeight int) string {
 	var daserPanel string
 	pad := strings.Repeat(" ", padding)
 	if m.currentStats == nil {
