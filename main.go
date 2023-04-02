@@ -287,36 +287,14 @@ func (m *model) updateStats() tea.Cmd {
 }
 
 func (m *model) updatePeers() tea.Cmd {
-	banned, updateBanned := m.updateBannedPeers()
-	updateActive := m.updateActivePeers(banned)
-	return tea.Batch(updateBanned, updateActive)
+	return tea.Batch(
+		m.refreshPeerList(&m.bannedPeers, &m.bannedPeerList, m.client.P2P.ListBlockedPeers),
+		m.refreshPeerList(&m.peers, &m.peerList, m.client.P2P.Peers),
+	)
 }
 
-func (m *model) updateBannedPeers() (map[string]struct{}, tea.Cmd) {
-	banned := make(map[string]struct{})
-	bannedPeers, err := m.client.P2P.ListBlockedPeers(context.TODO())
-	if err != nil {
-		return banned, nil
-	}
-	sort.Slice(bannedPeers, func(i, j int) bool {
-		return bannedPeers[i].String() < bannedPeers[j].String()
-	})
-
-	if len(bannedPeers) != len(m.bannedPeers) {
-		m.bannedPeers = make([]peer.AddrInfo, 0)
-		for _, peer := range bannedPeers {
-			banned[peer.String()] = struct{}{}
-			m.bannedPeers = append(m.bannedPeers, m.getAddrInfo(peer))
-		}
-		return banned, m.bannedPeerList.SetItems(m.buildPeerList(m.bannedPeers))
-	}
-
-	return banned, nil
-}
-
-// calling P2P.Peers() also returns banned peers, so we need to filter them out
-func (m *model) updateActivePeers(banned map[string]struct{}) tea.Cmd {
-	peers, err := m.client.P2P.Peers(context.TODO())
+func (m *model) refreshPeerList(peerList *[]peer.AddrInfo, uiList *list.Model, fetchPeers func(context.Context) ([]peer.ID, error)) tea.Cmd {
+	peers, err := fetchPeers(context.TODO())
 	if err != nil {
 		return nil
 	}
@@ -324,29 +302,19 @@ func (m *model) updateActivePeers(banned map[string]struct{}) tea.Cmd {
 		return peers[i].String() < peers[j].String()
 	})
 
-	if len(peers)-len(banned) != len(m.peers) {
-		m.peers = make([]peer.AddrInfo, 0)
+	if len(peers) != len(*peerList) {
+		peerListItems := make([]list.Item, 0, len(peers))
 		for _, peer := range peers {
-			_, ok := banned[peer.String()]
-			if !ok {
-				m.peers = append(m.peers, m.getAddrInfo(peer))
+			addrInfo := m.getAddrInfo(peer)
+			desc := "No multiaddr found"
+			if len(addrInfo.Addrs) > 0 {
+				desc = addrInfo.Addrs[0].String()
 			}
+			peerListItems = append(peerListItems, listItem{title: addrInfo.String(), desc: desc})
 		}
-		return m.peerList.SetItems(m.buildPeerList(m.peers))
+		return uiList.SetItems(peerListItems)
 	}
 	return nil
-}
-
-func (m *model) buildPeerList(peers []peer.AddrInfo) []list.Item {
-	var peerListItems []list.Item
-	for _, peer := range peers {
-		desc := "No multiaddr found"
-		if len(peer.Addrs) > 0 {
-			desc = peer.Addrs[0].String()
-		}
-		peerListItems = append(peerListItems, listItem{title: peer.ID.String(), desc: desc})
-	}
-	return peerListItems
 }
 
 func (m *model) getPanelDimensions(scaleW, scaleH float64) (w, h int) {
